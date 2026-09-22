@@ -1,9 +1,11 @@
 package io.github.jqssun.airplay.ui
 
 import android.app.Activity
+import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn as AndroidxOptIn
 import androidx.compose.animation.animateColorAsState
@@ -22,23 +24,30 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.rounded.BrightnessHigh
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import android.content.Context
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -46,6 +55,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import android.graphics.Bitmap
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import io.github.jqssun.airplay.R
 import io.github.jqssun.airplay.service.AirPlayService.ServerState
 import io.github.jqssun.airplay.ui.gestures.BrightnessState
@@ -67,12 +79,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.ui.compose.material3.MiniController
-import androidx.media3.ui.compose.material3.buttons.NextButton
-import androidx.media3.ui.compose.material3.buttons.PlayPauseButton
-import androidx.media3.ui.compose.material3.buttons.PreviousButton
-import androidx.media3.ui.compose.material3.indicator.DurationText
-import androidx.media3.ui.compose.material3.indicator.PositionText
-import androidx.media3.ui.compose.material3.indicator.ProgressSlider
 import kotlin.math.abs
 import kotlinx.coroutines.delay
 
@@ -92,6 +98,8 @@ fun MainScreen(
 ) {
     var tab by remember { mutableStateOf(Tab.OVERVIEW) }
     var fullscreen by remember { mutableStateOf(false) }
+    // Apple Music TV-style: full-screen artwork while audio plays; Back returns to the main UI
+    var musicFullscreen by remember { mutableStateOf(false) }
     val pin by viewModel.pinCode.collectAsState()
     val connections by viewModel.connectionCount.collectAsState()
     val audioOnly by viewModel.audioOnly.collectAsState()
@@ -99,6 +107,16 @@ fun MainScreen(
     val videoSessionPending by viewModel.videoSessionPending.collectAsState()
     val mirroringActive by viewModel.mirroringActive.collectAsState()
     val autoFullscreen by viewModel.autoFullscreen.collectAsState()
+
+    val musicActive = audioOnly && connections > 0
+    LaunchedEffect(musicActive) {
+        if (musicActive) {
+            musicFullscreen = true
+            tab = Tab.OVERVIEW
+        } else {
+            musicFullscreen = false
+        }
+    }
 
     // don't use movableContentOf: moving AndroidView across subcomposition boundaries makes it crash on reparent
     val video: @Composable () -> Unit = {
@@ -132,15 +150,32 @@ fun MainScreen(
 
     val activity = LocalContext.current as? Activity
     val videoScreen = videoPlaybackActive || videoSessionPending
-    LaunchedEffect(fullscreen, videoScreen) {
+    LaunchedEffect(fullscreen, videoScreen, musicFullscreen) {
         val window = activity?.window ?: return@LaunchedEffect
         val controller = WindowInsetsControllerCompat(window, window.decorView)
-        if (fullscreen || videoScreen) {
+        if (fullscreen || videoScreen || musicFullscreen) {
             controller.hide(WindowInsetsCompat.Type.systemBars())
             controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         } else {
             controller.show(WindowInsetsCompat.Type.systemBars())
         }
+    }
+
+    if (musicFullscreen && musicActive && !videoScreen) {
+        if (isInPip) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color.Black),
+                contentAlignment = Alignment.Center
+            ) {
+                NowPlayingCoverArt(viewModel, fill = true)
+            }
+            return
+        }
+        FullscreenNowPlaying(
+            viewModel = viewModel,
+            onExit = { musicFullscreen = false }
+        )
+        return
     }
 
     if (videoScreen) {
@@ -515,8 +550,11 @@ fun MainScreen(
                 Column {
                     AudioMiniController(
                         viewModel,
-                        visible = audioOnly && connections > 0 && tab != Tab.OVERVIEW,
-                        onClick = { tab = Tab.OVERVIEW }
+                        visible = musicActive && !musicFullscreen && tab != Tab.OVERVIEW,
+                        onClick = {
+                            tab = Tab.OVERVIEW
+                            musicFullscreen = true
+                        }
                     )
                     NavigationBar {
                         Tab.entries.forEach { t ->
@@ -535,7 +573,10 @@ fun MainScreen(
             Box(modifier = Modifier.padding(padding)) {
                 TabContent(
                     tab, viewModel, video,
-                    onFullscreen = { fullscreen = true }, onPip = onPip, showAudioMode = audioOnly
+                    onFullscreen = { fullscreen = true },
+                    onPip = onPip,
+                    showAudioMode = musicActive,
+                    onOpenMusicFullscreen = { musicFullscreen = true }
                 )
             }
         }
@@ -569,12 +610,16 @@ private fun TabContent(
     video: @Composable () -> Unit,
     onFullscreen: () -> Unit,
     onPip: () -> Unit,
-    showAudioMode: Boolean
+    showAudioMode: Boolean,
+    onOpenMusicFullscreen: () -> Unit
 ) {
     when (tab) {
         Tab.OVERVIEW -> OverviewContent(
             viewModel, video,
-            onFullscreen = onFullscreen, onPip = onPip, showAudioMode = showAudioMode
+            onFullscreen = onFullscreen,
+            onPip = onPip,
+            showAudioMode = showAudioMode,
+            onOpenMusicFullscreen = onOpenMusicFullscreen
         )
         Tab.LOGS -> LogsScreen(viewModel)
         Tab.SETTINGS -> SettingsScreen(viewModel)
@@ -587,7 +632,8 @@ private fun OverviewContent(
     video: @Composable () -> Unit,
     onFullscreen: () -> Unit,
     onPip: () -> Unit,
-    showAudioMode: Boolean = false
+    showAudioMode: Boolean = false,
+    onOpenMusicFullscreen: () -> Unit = {}
 ) {
     val state by viewModel.serverState.collectAsState()
     val connections by viewModel.connectionCount.collectAsState()
@@ -618,7 +664,11 @@ private fun OverviewContent(
             val connecting = state == ServerState.RUNNING && connections > 0 &&
                 !mirroringActive && !videoPlaybackActive
             if (showAudioMode && state == ServerState.RUNNING && connections > 0) {
-                NowPlayingContent(viewModel)
+                // Compact overview while music continues in the background after Back
+                MusicPlayingOverview(
+                    viewModel = viewModel,
+                    onOpenFullscreen = onOpenMusicFullscreen
+                )
             } else {
                 if (state == ServerState.RUNNING && (mirroringActive || idlePreview)) {
                     video()
@@ -822,31 +872,74 @@ private fun FullscreenVideo(
 
 // dacp scanning is press-and-hold: beginff/beginrew while held, playresume on release
 @Composable
-private fun HoldScanButton(
-    icon: ImageVector,
-    contentDescription: String,
-    onBegin: () -> Unit,
-    onEnd: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier = modifier
-            .size(48.dp)
-            .clip(CircleShape)
-            .pointerInput(Unit) {
-                detectTapGestures(onPress = {
-                    onBegin()
-                    try {
-                        awaitRelease()
-                    } finally {
-                        onEnd()
-                    }
-                })
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(icon, contentDescription)
+private fun MinimalAudioProgress(viewModel: MainViewModel) {
+    val positionMs by viewModel.audioPositionMs.collectAsState()
+    val durationMs by viewModel.audioDurationMs.collectAsState()
+    val fraction = if (durationMs > 0L) {
+        (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
     }
+    val timeStyle = MaterialTheme.typography.labelSmall.copy(color = Color.White.copy(alpha = 0.55f))
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .clip(RoundedCornerShape(1.dp))
+                .background(Color.White.copy(alpha = 0.2f))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(fraction)
+                    .background(Color.White.copy(alpha = 0.9f))
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(formatAudioTime(positionMs), style = timeStyle)
+            Text(formatAudioTime(durationMs), style = timeStyle)
+        }
+    }
+}
+
+private fun formatAudioTime(ms: Long): String {
+    if (ms <= 0L) return "0:00"
+    val totalSec = (ms / 1000).toInt()
+    val m = totalSec / 60
+    val s = totalSec % 60
+    return "%d:%02d".format(m, s)
+}
+
+/** Average relative luminance of cover art for auto text contrast (0 = black, 1 = white). */
+private fun coverArtLuminance(bitmap: Bitmap): Float {
+    val w = bitmap.width.coerceAtLeast(1)
+    val h = bitmap.height.coerceAtLeast(1)
+    val stepX = (w / 16).coerceAtLeast(1)
+    val stepY = (h / 16).coerceAtLeast(1)
+    var sum = 0.0
+    var n = 0
+    var y = 0
+    while (y < h) {
+        var x = 0
+        while (x < w) {
+            val c = bitmap.getPixel(x, y)
+            val r = ((c shr 16) and 0xff) / 255.0
+            val g = ((c shr 8) and 0xff) / 255.0
+            val b = (c and 0xff) / 255.0
+            sum += 0.2126 * r + 0.7152 * g + 0.0722 * b
+            n++
+            x += stepX
+        }
+        y += stepY
+    }
+    return if (n == 0) 0.2f else (sum / n).toFloat()
 }
 
 @Composable
@@ -863,47 +956,36 @@ private fun AudioMiniController(viewModel: MainViewModel, visible: Boolean, onCl
 }
 
 @Composable
-@AndroidxOptIn(UnstableApi::class)
-private fun NowPlayingContent(viewModel: MainViewModel) {
+private fun MusicPlayingOverview(
+    viewModel: MainViewModel,
+    onOpenFullscreen: () -> Unit
+) {
     val track by viewModel.trackInfo.collectAsState()
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(24.dp)
+            .focusRequester(focus)
+            .focusable()
+            .clickable(onClick = onOpenFullscreen)
+            .onPreviewKeyEvent { e ->
+                if (e.type == KeyEventType.KeyDown &&
+                    (e.key == Key.DirectionCenter || e.key == Key.Enter || e.key == Key.NumPadEnter)
+                ) {
+                    onOpenFullscreen()
+                    true
+                } else {
+                    false
+                }
+            },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        // cover art
-        Box(
-            modifier = Modifier
-                .weight(1f, fill = false)
-                .aspectRatio(1f)
-                .fillMaxWidth(0.7f)
-                .clip(RoundedCornerShape(16.dp))
-                .background(MaterialTheme.colorScheme.surfaceContainerHighest),
-            contentAlignment = Alignment.Center
-        ) {
-            if (track.coverArt != null) {
-                Image(
-                    bitmap = track.coverArt!!.asImageBitmap(),
-                    contentDescription = stringResource(R.string.cd_cover_art),
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
-                )
-            } else {
-                Icon(
-                    Icons.Default.MusicNote,
-                    contentDescription = null,
-                    modifier = Modifier.size(64.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
-                )
-            }
-        }
-
-        Spacer(Modifier.height(20.dp))
-
-        // track info
+        NowPlayingCoverArt(viewModel, fill = false, modifier = Modifier.fillMaxWidth(0.45f))
+        Spacer(Modifier.height(16.dp))
         Text(
             text = track.title.ifEmpty { stringResource(R.string.unknown_track) },
             style = MaterialTheme.typography.titleMedium,
@@ -920,68 +1002,370 @@ private fun NowPlayingContent(viewModel: MainViewModel) {
                 overflow = TextOverflow.Ellipsis
             )
         }
-        if (track.album.isNotEmpty()) {
-            Text(
-                text = track.album,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = stringResource(R.string.music_press_ok_fullscreen),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+        )
+    }
+}
+
+@Composable
+private fun NowPlayingCoverArt(
+    viewModel: MainViewModel,
+    fill: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val track by viewModel.trackInfo.collectAsState()
+    Box(
+        modifier = modifier
+            .then(if (fill) Modifier.fillMaxSize() else Modifier.aspectRatio(1f))
+            .clip(if (fill) RoundedCornerShape(0.dp) else RoundedCornerShape(12.dp))
+            .background(Color(0xFF1C1C1E)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (track.coverArt != null) {
+            Image(
+                bitmap = track.coverArt!!.asImageBitmap(),
+                contentDescription = stringResource(R.string.cd_cover_art),
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Icon(
+                Icons.Default.MusicNote,
+                contentDescription = null,
+                modifier = Modifier.size(if (fill) 96.dp else 64.dp),
+                tint = Color.White.copy(alpha = 0.35f)
+            )
+        }
+    }
+}
+
+/**
+ * Apple Music (tvOS)-style now playing: full-screen artwork, chrome hidden until Select/OK.
+ * Back leaves this view and returns to the main tabs without stopping playback.
+ */
+@Composable
+@AndroidxOptIn(UnstableApi::class)
+private fun FullscreenNowPlaying(
+    viewModel: MainViewModel,
+    onExit: () -> Unit
+) {
+    val track by viewModel.trackInfo.collectAsState()
+    val audioPlaying by viewModel.audioPlaying.collectAsState()
+    var controlsVisible by remember { mutableStateOf(false) }
+    var showTick by remember { mutableIntStateOf(0) }
+    val rootFocus = remember { FocusRequester() }
+    val playPauseFocus = remember { FocusRequester() }
+    var playPauseFocused by remember { mutableStateOf(false) }
+
+    val whiteIconColors = IconButtonDefaults.iconButtonColors(
+        contentColor = Color.White,
+        disabledContentColor = Color.White.copy(alpha = 0.35f)
+    )
+
+    val titleColor by produceState(initialValue = Color.White, track.coverArt) {
+        val bmp = track.coverArt
+        value = if (bmp == null) {
+            Color.White
+        } else {
+            val lum = withContext(Dispatchers.Default) { coverArtLuminance(bmp) }
+            if (lum >= 0.55f) Color(0xFF121212) else Color.White
+        }
+    }
+    val artistColor = titleColor.copy(alpha = 0.75f)
+
+    fun revealControls() {
+        controlsVisible = true
+        showTick++
+    }
+
+    fun bumpIdle() {
+        if (controlsVisible) showTick++
+    }
+
+    // Auto-hide only while playing and idle; stay up while paused or while user keeps interacting
+    LaunchedEffect(showTick, controlsVisible, audioPlaying) {
+        if (!controlsVisible || !audioPlaying) return@LaunchedEffect
+        delay(MUSIC_CONTROLS_HIDE_MS)
+        controlsVisible = false
+    }
+
+    LaunchedEffect(controlsVisible) {
+        if (controlsVisible) {
+            playPauseFocus.requestFocusUntilLanded(attempts = 16) { playPauseFocused }
+        } else {
+            runCatching { rootFocus.requestFocus() }
+        }
+    }
+
+    BackHandler {
+        if (controlsVisible) controlsVisible = false else onExit()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .focusRequester(rootFocus)
+            .focusable()
+            .pointerInput(Unit) {
+                detectTapGestures {
+                    if (controlsVisible) controlsVisible = false else revealControls()
+                }
+            }
+            .onPreviewKeyEvent { e ->
+                if (e.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (e.key) {
+                    Key.MediaNext, Key.MediaSkipForward -> {
+                        viewModel.audioNext()
+                        revealControls()
+                        true
+                    }
+                    Key.MediaPrevious, Key.MediaSkipBackward -> {
+                        viewModel.audioPrev()
+                        revealControls()
+                        true
+                    }
+                    Key.MediaPlayPause -> {
+                        viewModel.audioTogglePlayPause()
+                        revealControls()
+                        true
+                    }
+                    Key.MediaPlay -> {
+                        if (!audioPlaying) viewModel.audioTogglePlayPause()
+                        revealControls()
+                        true
+                    }
+                    Key.MediaPause -> {
+                        if (audioPlaying) viewModel.audioTogglePlayPause()
+                        revealControls()
+                        true
+                    }
+                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter,
+                    Key.DirectionLeft, Key.DirectionRight, Key.DirectionUp, Key.DirectionDown -> {
+                        if (!controlsVisible) {
+                            revealControls()
+                            true
+                        } else {
+                            bumpIdle()
+                            false
+                        }
+                    }
+                    Key.Back, Key.Escape -> {
+                        if (controlsVisible) {
+                            controlsVisible = false
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    else -> false
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        // Full-opacity blurred ambient backdrop from artwork
+        if (track.coverArt != null) {
+            Image(
+                bitmap = track.coverArt!!.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (Build.VERSION.SDK_INT >= 31) {
+                            Modifier.blur(48.dp)
+                        } else {
+                            Modifier.graphicsLayer { alpha = 0.55f }
+                        }
+                    ),
+                contentScale = ContentScale.Crop
             )
         }
 
-        Spacer(Modifier.height(16.dp))
-
-        val player = viewModel.dacpPlayer
-        if (player != null) {
-            // BottomControls' default row, minus its video-overlay gradient
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                PositionText(player, Modifier.padding(end = 8.dp))
-                Box(modifier = Modifier.weight(1f)) { ProgressSlider(player) }
-                DurationText(player, Modifier.padding(start = 8.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colorStops = arrayOf(
+                            0f to Color.Transparent,
+                            0.55f to Color.Transparent,
+                            0.85f to Color.Black.copy(alpha = 0.45f),
+                            1f to Color.Black.copy(alpha = 0.75f)
+                        )
+                    )
+                )
+                .padding(horizontal = 48.dp, vertical = 36.dp)
+        ) {
+            // Fixed slot so progress fades in above cover/text without shifting them
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = controlsVisible,
+                    enter = androidx.compose.animation.fadeIn(),
+                    exit = androidx.compose.animation.fadeOut()
+                ) {
+                    CompositionLocalProvider(LocalContentColor provides Color.White) {
+                        MinimalAudioProgress(viewModel)
+                    }
+                }
             }
 
-            Spacer(Modifier.height(8.dp))
-
+            // Cover left, title/artist right — fixed middle band
             Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
+                horizontalArrangement = Arrangement.spacedBy(40.dp)
             ) {
-                HoldScanButton(
-                    icon = Icons.Default.FastRewind,
-                    contentDescription = stringResource(R.string.cd_rewind),
-                    onBegin = { viewModel.audioScanBegin(false) },
-                    onEnd = { viewModel.audioScanEnd() }
-                )
-                PreviousButton(player, modifier = Modifier.dpadFocus())
-                PlayPauseButton(
-                    player,
-                    modifier = Modifier.size(63.dp).dpadFocus(CircleShape),
-                    iconSize = 40.dp
-                )
-                NextButton(player, modifier = Modifier.dpadFocus())
-                HoldScanButton(
-                    icon = Icons.Default.FastForward,
-                    contentDescription = stringResource(R.string.cd_fast_forward),
-                    onBegin = { viewModel.audioScanBegin(true) },
-                    onEnd = { viewModel.audioScanEnd() }
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight(0.9f)
+                        .aspectRatio(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF2C2C2E)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (track.coverArt != null) {
+                        Image(
+                            bitmap = track.coverArt!!.asImageBitmap(),
+                            contentDescription = stringResource(R.string.cd_cover_art),
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Icon(
+                            Icons.Default.MusicNote,
+                            contentDescription = null,
+                            modifier = Modifier.size(96.dp),
+                            tint = Color.White.copy(alpha = 0.35f)
+                        )
+                    }
+                    if (!audioPlaying && !controlsVisible) {
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.28f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Rounded.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(88.dp),
+                                tint = Color.White.copy(alpha = 0.85f)
+                            )
+                        }
+                    }
+                }
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = track.title.ifEmpty { stringResource(R.string.unknown_track) },
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = titleColor,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (track.artist.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = track.artist,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = artistColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
             }
 
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
+            // Fixed slot so transport fades in below without shifting cover/text
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(88.dp),
+                contentAlignment = Alignment.Center
             ) {
-                IconButton(onClick = { viewModel.audioVolumeDown() }, modifier = Modifier.dpadFocus()) {
-                    Icon(Icons.AutoMirrored.Rounded.VolumeDown, stringResource(R.string.cd_volume_down))
-                }
-                IconButton(onClick = { viewModel.audioMuteToggle() }, modifier = Modifier.dpadFocus()) {
-                    Icon(Icons.AutoMirrored.Rounded.VolumeOff, stringResource(R.string.cd_mute))
-                }
-                IconButton(onClick = { viewModel.audioVolumeUp() }, modifier = Modifier.dpadFocus()) {
-                    Icon(Icons.AutoMirrored.Rounded.VolumeUp, stringResource(R.string.cd_volume_up))
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = controlsVisible,
+                    enter = androidx.compose.animation.fadeIn(),
+                    exit = androidx.compose.animation.fadeOut()
+                ) {
+                    CompositionLocalProvider(LocalContentColor provides Color.White) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            IconButton(
+                                onClick = {
+                                    bumpIdle()
+                                    viewModel.audioPrev()
+                                },
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .dpadFocus(CircleShape)
+                                    .onFocusChanged { if (it.hasFocus) bumpIdle() },
+                                colors = whiteIconColors
+                            ) {
+                                Icon(
+                                    Icons.Default.SkipPrevious,
+                                    contentDescription = stringResource(R.string.cd_previous),
+                                    modifier = Modifier.size(36.dp)
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    bumpIdle()
+                                    viewModel.audioTogglePlayPause()
+                                },
+                                modifier = Modifier
+                                    .size(72.dp)
+                                    .focusRequester(playPauseFocus)
+                                    .onFocusChanged {
+                                        playPauseFocused = it.hasFocus
+                                        if (it.hasFocus) bumpIdle()
+                                    }
+                                    .dpadFocus(CircleShape),
+                                colors = whiteIconColors
+                            ) {
+                                Icon(
+                                    if (audioPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                    contentDescription = stringResource(R.string.cd_play_pause),
+                                    modifier = Modifier.size(44.dp)
+                                )
+                            }
+                            IconButton(
+                                onClick = {
+                                    bumpIdle()
+                                    viewModel.audioNext()
+                                },
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .dpadFocus(CircleShape)
+                                    .onFocusChanged { if (it.hasFocus) bumpIdle() },
+                                colors = whiteIconColors
+                            ) {
+                                Icon(
+                                    Icons.Default.SkipNext,
+                                    contentDescription = stringResource(R.string.cd_next),
+                                    modifier = Modifier.size(36.dp)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -989,6 +1373,7 @@ private fun NowPlayingContent(viewModel: MainViewModel) {
 }
 
 private const val VIDEO_OVERLAY_HIDE_MS = 4000L
+private const val MUSIC_CONTROLS_HIDE_MS = 5000L
 
 @Composable
 private fun DebugOverlay(info: DebugInfo, modifier: Modifier = Modifier) {
