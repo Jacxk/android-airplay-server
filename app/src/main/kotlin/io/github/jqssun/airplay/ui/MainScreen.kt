@@ -40,6 +40,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -870,9 +871,13 @@ private fun FullscreenVideo(
     }
 }
 
-// dacp scanning is press-and-hold: beginff/beginrew while held, playresume on release
+// Soft edge-to-edge scrim (accent) behind chrome that matches the title color.
 @Composable
-private fun MinimalAudioProgress(viewModel: MainViewModel) {
+private fun MinimalAudioProgress(
+    viewModel: MainViewModel,
+    accent: Color,
+    chrome: Color
+) {
     val positionMs by viewModel.audioPositionMs.collectAsState()
     val durationMs by viewModel.audioDurationMs.collectAsState()
     val fraction = if (durationMs > 0L) {
@@ -880,32 +885,87 @@ private fun MinimalAudioProgress(viewModel: MainViewModel) {
     } else {
         0f
     }
-    val timeStyle = MaterialTheme.typography.labelSmall.copy(color = Color.White.copy(alpha = 0.55f))
+    val timeStyle = MaterialTheme.typography.labelSmall.copy(color = chrome.copy(alpha = 0.65f))
 
-    Column(modifier = Modifier.fillMaxWidth()) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Gradient from the top edge down (no inset / rounded card)
         Box(
+            Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colorStops = arrayOf(
+                            0f to accent.copy(alpha = 0.55f),
+                            0.45f to accent.copy(alpha = 0.28f),
+                            1f to Color.Transparent
+                        )
+                    )
+                )
+        )
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(2.dp)
-                .clip(RoundedCornerShape(1.dp))
-                .background(Color.White.copy(alpha = 0.2f))
+                .align(Alignment.BottomCenter)
+                .padding(horizontal = 48.dp, vertical = 8.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .fillMaxHeight()
-                    .fillMaxWidth(fraction)
-                    .background(Color.White.copy(alpha = 0.9f))
-            )
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .clip(RoundedCornerShape(1.dp))
+                    .background(chrome.copy(alpha = 0.25f))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .fillMaxWidth(fraction)
+                        .background(chrome.copy(alpha = 0.95f))
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(formatAudioTime(positionMs), style = timeStyle)
+                Text(formatAudioTime(durationMs), style = timeStyle)
+            }
         }
-        Row(
+    }
+}
+
+@Composable
+private fun CoverArtShadow(
+    accent: Color,
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit
+) {
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        // Soft radial glow (smooth fade like the progress scrim), max ~25% opacity
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.radialGradient(
+                        colorStops = arrayOf(
+                            0.00f to accent.copy(alpha = 0.25f),
+                            0.45f to accent.copy(alpha = 0.18f),
+                            0.70f to accent.copy(alpha = 0.10f),
+                            0.88f to accent.copy(alpha = 0.04f),
+                            1.00f to Color.Transparent
+                        )
+                    )
+                )
+        )
+        // Cover inset so the glow halo is visible around the edges
+        Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 6.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(formatAudioTime(positionMs), style = timeStyle)
-            Text(formatAudioTime(durationMs), style = timeStyle)
-        }
+                .fillMaxSize(0.86f)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color(0xFF2C2C2E)),
+            content = content
+        )
     }
 }
 
@@ -917,17 +977,23 @@ private fun formatAudioTime(ms: Long): String {
     return "%d:%02d".format(m, s)
 }
 
-/** Average relative luminance of cover art for auto text contrast (0 = black, 1 = white). */
-private fun coverArtLuminance(bitmap: Bitmap): Float {
+/**
+ * Average luminance of the region behind title/artist (right side of the art,
+ * mid-vertical band) so contrast tracks where text actually sits on the blurred backdrop.
+ */
+private fun coverArtTextRegionLuminance(bitmap: Bitmap): Float {
     val w = bitmap.width.coerceAtLeast(1)
     val h = bitmap.height.coerceAtLeast(1)
-    val stepX = (w / 16).coerceAtLeast(1)
-    val stepY = (h / 16).coerceAtLeast(1)
+    val x0 = (w * 0.5f).toInt().coerceIn(0, w - 1)
+    val y0 = (h * 0.22f).toInt().coerceIn(0, h - 1)
+    val y1 = (h * 0.78f).toInt().coerceAtLeast(y0 + 1).coerceAtMost(h)
+    val stepX = ((w - x0) / 12).coerceAtLeast(1)
+    val stepY = ((y1 - y0) / 12).coerceAtLeast(1)
     var sum = 0.0
     var n = 0
-    var y = 0
-    while (y < h) {
-        var x = 0
+    var y = y0
+    while (y < y1) {
+        var x = x0
         while (x < w) {
             val c = bitmap.getPixel(x, y)
             val r = ((c shr 16) and 0xff) / 255.0
@@ -1061,21 +1127,24 @@ private fun FullscreenNowPlaying(
     val playPauseFocus = remember { FocusRequester() }
     var playPauseFocused by remember { mutableStateOf(false) }
 
-    val whiteIconColors = IconButtonDefaults.iconButtonColors(
-        contentColor = Color.White,
-        disabledContentColor = Color.White.copy(alpha = 0.35f)
-    )
-
     val titleColor by produceState(initialValue = Color.White, track.coverArt) {
         val bmp = track.coverArt
         value = if (bmp == null) {
             Color.White
         } else {
-            val lum = withContext(Dispatchers.Default) { coverArtLuminance(bmp) }
+            val lum = withContext(Dispatchers.Default) { coverArtTextRegionLuminance(bmp) }
             if (lum >= 0.55f) Color(0xFF121212) else Color.White
         }
     }
     val artistColor = titleColor.copy(alpha = 0.75f)
+    // Scrim is the opposite of the title so white/black text+controls stay readable on it.
+    val scrimColor = if (titleColor.luminance() >= 0.5f) Color(0xFF121212) else Color.White
+    val chromeIconColors = IconButtonDefaults.iconButtonColors(
+        containerColor = Color.Transparent,
+        contentColor = titleColor,
+        disabledContainerColor = Color.Transparent,
+        disabledContentColor = titleColor.copy(alpha = 0.35f)
+    )
 
     fun revealControls() {
         controlsVisible = true
@@ -1188,33 +1257,25 @@ private fun FullscreenNowPlaying(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        colorStops = arrayOf(
-                            0f to Color.Transparent,
-                            0.55f to Color.Transparent,
-                            0.85f to Color.Black.copy(alpha = 0.45f),
-                            1f to Color.Black.copy(alpha = 0.75f)
-                        )
-                    )
-                )
-                .padding(horizontal = 48.dp, vertical = 36.dp)
+                .padding(vertical = 0.dp)
         ) {
             // Fixed slot so progress fades in above cover/text without shifting them
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(52.dp),
-                contentAlignment = Alignment.BottomCenter
+                    .height(72.dp),
+                contentAlignment = Alignment.TopCenter
             ) {
                 androidx.compose.animation.AnimatedVisibility(
                     visible = controlsVisible,
                     enter = androidx.compose.animation.fadeIn(),
                     exit = androidx.compose.animation.fadeOut()
                 ) {
-                    CompositionLocalProvider(LocalContentColor provides Color.White) {
-                        MinimalAudioProgress(viewModel)
-                    }
+                    MinimalAudioProgress(
+                        viewModel = viewModel,
+                        accent = scrimColor,
+                        chrome = titleColor
+                    )
                 }
             }
 
@@ -1222,17 +1283,16 @@ private fun FullscreenNowPlaying(
             Row(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .padding(horizontal = 48.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(40.dp)
             ) {
-                Box(
+                CoverArtShadow(
+                    accent = titleColor,
                     modifier = Modifier
                         .fillMaxHeight(0.9f)
                         .aspectRatio(1f)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFF2C2C2E)),
-                    contentAlignment = Alignment.Center
                 ) {
                     if (track.coverArt != null) {
                         Image(
@@ -1295,74 +1355,93 @@ private fun FullscreenNowPlaying(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(88.dp),
-                contentAlignment = Alignment.Center
+                    .height(104.dp),
+                contentAlignment = Alignment.BottomCenter
             ) {
                 androidx.compose.animation.AnimatedVisibility(
                     visible = controlsVisible,
                     enter = androidx.compose.animation.fadeIn(),
                     exit = androidx.compose.animation.fadeOut()
                 ) {
-                    CompositionLocalProvider(LocalContentColor provides Color.White) {
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            IconButton(
-                                onClick = {
-                                    bumpIdle()
-                                    viewModel.audioPrev()
-                                },
-                                modifier = Modifier
-                                    .size(56.dp)
-                                    .dpadFocus(CircleShape)
-                                    .onFocusChanged { if (it.hasFocus) bumpIdle() },
-                                colors = whiteIconColors
-                            ) {
-                                Icon(
-                                    Icons.Default.SkipPrevious,
-                                    contentDescription = stringResource(R.string.cd_previous),
-                                    modifier = Modifier.size(36.dp)
+                    Box(Modifier.fillMaxSize()) {
+                        // Edge-to-edge gradient from the bottom up
+                        Box(
+                            Modifier
+                                .fillMaxSize()
+                                .background(
+                                    Brush.verticalGradient(
+                                        colorStops = arrayOf(
+                                            0f to Color.Transparent,
+                                            0.4f to scrimColor.copy(alpha = 0.28f),
+                                            1f to scrimColor.copy(alpha = 0.55f)
+                                        )
+                                    )
                                 )
-                            }
-                            IconButton(
-                                onClick = {
-                                    bumpIdle()
-                                    viewModel.audioTogglePlayPause()
-                                },
+                        )
+                        CompositionLocalProvider(LocalContentColor provides titleColor) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
+                                verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier
-                                    .size(72.dp)
-                                    .focusRequester(playPauseFocus)
-                                    .onFocusChanged {
-                                        playPauseFocused = it.hasFocus
-                                        if (it.hasFocus) bumpIdle()
-                                    }
-                                    .dpadFocus(CircleShape),
-                                colors = whiteIconColors
+                                    .fillMaxWidth()
+                                    .align(Alignment.Center)
+                                    .padding(horizontal = 48.dp, vertical = 8.dp)
                             ) {
-                                Icon(
-                                    if (audioPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                    contentDescription = stringResource(R.string.cd_play_pause),
-                                    modifier = Modifier.size(44.dp)
-                                )
-                            }
-                            IconButton(
-                                onClick = {
-                                    bumpIdle()
-                                    viewModel.audioNext()
-                                },
-                                modifier = Modifier
-                                    .size(56.dp)
-                                    .dpadFocus(CircleShape)
-                                    .onFocusChanged { if (it.hasFocus) bumpIdle() },
-                                colors = whiteIconColors
-                            ) {
-                                Icon(
-                                    Icons.Default.SkipNext,
-                                    contentDescription = stringResource(R.string.cd_next),
-                                    modifier = Modifier.size(36.dp)
-                                )
+                                IconButton(
+                                    onClick = {
+                                        bumpIdle()
+                                        viewModel.audioPrev()
+                                    },
+                                    modifier = Modifier
+                                        .size(56.dp)
+                                        .dpadFocus(CircleShape, titleColor)
+                                        .onFocusChanged { if (it.hasFocus) bumpIdle() },
+                                    colors = chromeIconColors
+                                ) {
+                                    Icon(
+                                        Icons.Default.SkipPrevious,
+                                        contentDescription = stringResource(R.string.cd_previous),
+                                        modifier = Modifier.size(36.dp)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        bumpIdle()
+                                        viewModel.audioTogglePlayPause()
+                                    },
+                                    modifier = Modifier
+                                        .size(72.dp)
+                                        .focusRequester(playPauseFocus)
+                                        .onFocusChanged {
+                                            playPauseFocused = it.hasFocus
+                                            if (it.hasFocus) bumpIdle()
+                                        }
+                                        .dpadFocus(CircleShape, titleColor),
+                                    colors = chromeIconColors
+                                ) {
+                                    Icon(
+                                        if (audioPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                        contentDescription = stringResource(R.string.cd_play_pause),
+                                        modifier = Modifier.size(44.dp)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        bumpIdle()
+                                        viewModel.audioNext()
+                                    },
+                                    modifier = Modifier
+                                        .size(56.dp)
+                                        .dpadFocus(CircleShape, titleColor)
+                                        .onFocusChanged { if (it.hasFocus) bumpIdle() },
+                                    colors = chromeIconColors
+                                ) {
+                                    Icon(
+                                        Icons.Default.SkipNext,
+                                        contentDescription = stringResource(R.string.cd_next),
+                                        modifier = Modifier.size(36.dp)
+                                    )
+                                }
                             }
                         }
                     }
