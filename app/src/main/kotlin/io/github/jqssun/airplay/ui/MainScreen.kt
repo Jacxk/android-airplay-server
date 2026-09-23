@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn as AndroidxOptIn
@@ -40,7 +41,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -49,6 +49,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -56,9 +57,6 @@ import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import android.graphics.Bitmap
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import io.github.jqssun.airplay.R
 import io.github.jqssun.airplay.service.AirPlayService.ServerState
 import io.github.jqssun.airplay.ui.gestures.BrightnessState
@@ -81,7 +79,10 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.ui.compose.material3.MiniController
 import kotlin.math.abs
+import kotlin.math.pow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 private enum class Tab(val labelRes: Int, val icon: ImageVector) {
     OVERVIEW(R.string.tab_overview, Icons.Default.Cast),
@@ -885,10 +886,10 @@ private fun MinimalAudioProgress(
     } else {
         0f
     }
-    val timeStyle = MaterialTheme.typography.labelSmall.copy(color = chrome.copy(alpha = 0.65f))
+    val timeStyle = MaterialTheme.typography.labelSmall
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Gradient from the top edge down (no inset / rounded card)
+        // Gradient follows the independently detected top-zone contrast.
         Box(
             Modifier
                 .fillMaxSize()
@@ -928,8 +929,16 @@ private fun MinimalAudioProgress(
                     .padding(top = 6.dp),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text(formatAudioTime(positionMs), style = timeStyle)
-                Text(formatAudioTime(durationMs), style = timeStyle)
+                Text(
+                    text = formatAudioTime(positionMs),
+                    style = timeStyle,
+                    color = chrome.copy(alpha = 0.78f)
+                )
+                Text(
+                    text = formatAudioTime(durationMs),
+                    style = timeStyle,
+                    color = chrome.copy(alpha = 0.78f)
+                )
             }
         }
     }
@@ -977,35 +986,115 @@ private fun formatAudioTime(ms: Long): String {
     return "%d:%02d".format(m, s)
 }
 
+/** Foreground and its opposite-color ambient scrim for one screen region. */
+private data class ZoneContrast(val chrome: Color, val scrim: Color)
+
+private data class NowPlayingContrast(
+    val top: ZoneContrast,
+    val middle: ZoneContrast,
+    val bottom: ZoneContrast,
+)
+
 /**
- * Average luminance of the region behind title/artist (right side of the art,
- * mid-vertical band) so contrast tracks where text actually sits on the blurred backdrop.
+ * Samples a rectangle expressed in viewport coordinates from the exact source
+ * crop produced by ContentScale.Crop.
  */
-private fun coverArtTextRegionLuminance(bitmap: Bitmap): Float {
-    val w = bitmap.width.coerceAtLeast(1)
-    val h = bitmap.height.coerceAtLeast(1)
-    val x0 = (w * 0.5f).toInt().coerceIn(0, w - 1)
-    val y0 = (h * 0.22f).toInt().coerceIn(0, h - 1)
-    val y1 = (h * 0.78f).toInt().coerceAtLeast(y0 + 1).coerceAtMost(h)
-    val stepX = ((w - x0) / 12).coerceAtLeast(1)
-    val stepY = ((y1 - y0) / 12).coerceAtLeast(1)
-    var sum = 0.0
-    var n = 0
-    var y = y0
-    while (y < y1) {
-        var x = x0
-        while (x < w) {
-            val c = bitmap.getPixel(x, y)
-            val r = ((c shr 16) and 0xff) / 255.0
-            val g = ((c shr 8) and 0xff) / 255.0
-            val b = (c and 0xff) / 255.0
-            sum += 0.2126 * r + 0.7152 * g + 0.0722 * b
-            n++
-            x += stepX
-        }
-        y += stepY
+private fun viewportRegionLuminances(
+    bitmap: Bitmap,
+    viewportAspect: Float,
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float,
+    columns: Int = 24,
+    rows: Int = 16,
+): FloatArray {
+    val width = bitmap.width.coerceAtLeast(1)
+    val height = bitmap.height.coerceAtLeast(1)
+    val sourceAspect = width.toFloat() / height.toFloat()
+    val safeViewportAspect = viewportAspect.coerceAtLeast(0.1f)
+
+    var cropX = 0f
+    var cropY = 0f
+    var visibleWidth = 1f
+    var visibleHeight = 1f
+    if (sourceAspect > safeViewportAspect) {
+        visibleWidth = safeViewportAspect / sourceAspect
+        cropX = (1f - visibleWidth) / 2f
+    } else {
+        visibleHeight = sourceAspect / safeViewportAspect
+        cropY = (1f - visibleHeight) / 2f
     }
-    return if (n == 0) 0.2f else (sum / n).toFloat()
+
+    fun linearChannel(channel: Int): Double {
+        val srgb = channel / 255.0
+        return if (srgb <= 0.04045) {
+            srgb / 12.92
+        } else {
+            ((srgb + 0.055) / 1.055).pow(2.4)
+        }
+    }
+
+    return FloatArray(columns * rows) { index ->
+        val column = index % columns
+        val row = index / columns
+        val viewportX = x0 + (x1 - x0) * ((column + 0.5f) / columns)
+        val viewportY = y0 + (y1 - y0) * ((row + 0.5f) / rows)
+        val sourceX = cropX + viewportX.coerceIn(0f, 1f) * visibleWidth
+        val sourceY = cropY + viewportY.coerceIn(0f, 1f) * visibleHeight
+        val pixelX = (sourceX * (width - 1)).toInt().coerceIn(0, width - 1)
+        val pixelY = (sourceY * (height - 1)).toInt().coerceIn(0, height - 1)
+        val pixel = bitmap.getPixel(pixelX, pixelY)
+        val red = linearChannel((pixel shr 16) and 0xff)
+        val green = linearChannel((pixel shr 8) and 0xff)
+        val blue = linearChannel(pixel and 0xff)
+        (0.2126 * red + 0.7152 * green + 0.0722 * blue).toFloat()
+    }
+}
+
+/**
+ * Chooses the foreground whose contrast remains strongest across the zone.
+ * The 10th percentile protects against sizeable light/dark patches while the
+ * median prevents a few outlier pixels from flipping otherwise uniform art.
+ */
+private fun contrastFromSamples(luminances: FloatArray): ZoneContrast {
+    if (luminances.isEmpty()) return ZoneContrast(Color.White, Color.Black)
+
+    fun robustScore(ratios: FloatArray): Float {
+        ratios.sort()
+        val low = ratios[((ratios.lastIndex * 0.10f).toInt()).coerceIn(ratios.indices)]
+        val median = ratios[ratios.size / 2]
+        return low * 0.72f + median * 0.28f
+    }
+
+    val blackRatios = FloatArray(luminances.size) { (luminances[it] + 0.05f) / 0.05f }
+    val whiteRatios = FloatArray(luminances.size) { 1.05f / (luminances[it] + 0.05f) }
+    return if (robustScore(blackRatios) > robustScore(whiteRatios)) {
+        ZoneContrast(chrome = Color(0xFF101010), scrim = Color.White)
+    } else {
+        ZoneContrast(chrome = Color.White, scrim = Color.Black)
+    }
+}
+
+private fun nowPlayingContrastFromCover(
+    bitmap: Bitmap?,
+    viewportAspect: Float,
+    topEnd: Float,
+    bottomStart: Float,
+): NowPlayingContrast {
+    val fallback = ZoneContrast(chrome = Color.White, scrim = Color.Black)
+    if (bitmap == null) return NowPlayingContrast(fallback, fallback, fallback)
+
+    val top = contrastFromSamples(
+        viewportRegionLuminances(bitmap, viewportAspect, 0.02f, 0f, 0.98f, topEnd)
+    )
+    val middle = contrastFromSamples(
+        viewportRegionLuminances(bitmap, viewportAspect, 0.46f, 0.36f, 0.98f, 0.64f)
+    )
+    val bottom = contrastFromSamples(
+        viewportRegionLuminances(bitmap, viewportAspect, 0.02f, bottomStart, 0.98f, 1f)
+    )
+    return NowPlayingContrast(top = top, middle = middle, bottom = bottom)
 }
 
 @Composable
@@ -1127,23 +1216,32 @@ private fun FullscreenNowPlaying(
     val playPauseFocus = remember { FocusRequester() }
     var playPauseFocused by remember { mutableStateOf(false) }
 
-    val titleColor by produceState(initialValue = Color.White, track.coverArt) {
-        val bmp = track.coverArt
-        value = if (bmp == null) {
-            Color.White
-        } else {
-            val lum = withContext(Dispatchers.Default) { coverArtTextRegionLuminance(bmp) }
-            if (lum >= 0.55f) Color(0xFF121212) else Color.White
+    val configuration = LocalConfiguration.current
+    val viewportAspect = configuration.screenWidthDp.toFloat() /
+        configuration.screenHeightDp.coerceAtLeast(1).toFloat()
+    val topEnd = (72f / configuration.screenHeightDp.coerceAtLeast(1)).coerceIn(0.04f, 0.16f)
+    val bottomStart = (1f - 104f / configuration.screenHeightDp.coerceAtLeast(1))
+        .coerceIn(0.80f, 0.94f)
+    val contrast by produceState(
+        initialValue = nowPlayingContrastFromCover(null, viewportAspect, topEnd, bottomStart),
+        track.coverArt,
+        viewportAspect,
+        topEnd,
+        bottomStart,
+    ) {
+        value = withContext(Dispatchers.Default) {
+            nowPlayingContrastFromCover(track.coverArt, viewportAspect, topEnd, bottomStart)
         }
     }
-    val artistColor = titleColor.copy(alpha = 0.75f)
-    // Scrim is the opposite of the title so white/black text+controls stay readable on it.
-    val scrimColor = if (titleColor.luminance() >= 0.5f) Color(0xFF121212) else Color.White
-    val chromeIconColors = IconButtonDefaults.iconButtonColors(
+    val top = contrast.top
+    val middle = contrast.middle
+    val bottom = contrast.bottom
+    val artistColor = middle.chrome.copy(alpha = 0.78f)
+    val bottomIconColors = IconButtonDefaults.iconButtonColors(
         containerColor = Color.Transparent,
-        contentColor = titleColor,
+        contentColor = bottom.chrome,
         disabledContainerColor = Color.Transparent,
-        disabledContentColor = titleColor.copy(alpha = 0.35f)
+        disabledContentColor = bottom.chrome.copy(alpha = 0.35f)
     )
 
     fun revealControls() {
@@ -1273,8 +1371,8 @@ private fun FullscreenNowPlaying(
                 ) {
                     MinimalAudioProgress(
                         viewModel = viewModel,
-                        accent = scrimColor,
-                        chrome = titleColor
+                        accent = top.scrim,
+                        chrome = top.chrome
                     )
                 }
             }
@@ -1289,7 +1387,7 @@ private fun FullscreenNowPlaying(
                 horizontalArrangement = Arrangement.spacedBy(40.dp)
             ) {
                 CoverArtShadow(
-                    accent = titleColor,
+                    accent = middle.chrome,
                     modifier = Modifier
                         .fillMaxHeight(0.9f)
                         .aspectRatio(1f)
@@ -1332,9 +1430,10 @@ private fun FullscreenNowPlaying(
                 ) {
                     Text(
                         text = track.title.ifEmpty { stringResource(R.string.unknown_track) },
-                        style = MaterialTheme.typography.headlineMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = titleColor,
+                        style = MaterialTheme.typography.headlineMedium.copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = middle.chrome,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -1372,13 +1471,13 @@ private fun FullscreenNowPlaying(
                                     Brush.verticalGradient(
                                         colorStops = arrayOf(
                                             0f to Color.Transparent,
-                                            0.4f to scrimColor.copy(alpha = 0.28f),
-                                            1f to scrimColor.copy(alpha = 0.55f)
+                                            0.4f to bottom.scrim.copy(alpha = 0.28f),
+                                            1f to bottom.scrim.copy(alpha = 0.55f)
                                         )
                                     )
                                 )
                         )
-                        CompositionLocalProvider(LocalContentColor provides titleColor) {
+                        CompositionLocalProvider(LocalContentColor provides bottom.chrome) {
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterHorizontally),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -1394,9 +1493,9 @@ private fun FullscreenNowPlaying(
                                     },
                                     modifier = Modifier
                                         .size(56.dp)
-                                        .dpadFocus(CircleShape, titleColor)
+                                        .dpadFocus(CircleShape, bottom.chrome)
                                         .onFocusChanged { if (it.hasFocus) bumpIdle() },
-                                    colors = chromeIconColors
+                                    colors = bottomIconColors
                                 ) {
                                     Icon(
                                         Icons.Default.SkipPrevious,
@@ -1416,8 +1515,8 @@ private fun FullscreenNowPlaying(
                                             playPauseFocused = it.hasFocus
                                             if (it.hasFocus) bumpIdle()
                                         }
-                                        .dpadFocus(CircleShape, titleColor),
-                                    colors = chromeIconColors
+                                        .dpadFocus(CircleShape, bottom.chrome),
+                                    colors = bottomIconColors
                                 ) {
                                     Icon(
                                         if (audioPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
@@ -1432,9 +1531,9 @@ private fun FullscreenNowPlaying(
                                     },
                                     modifier = Modifier
                                         .size(56.dp)
-                                        .dpadFocus(CircleShape, titleColor)
+                                        .dpadFocus(CircleShape, bottom.chrome)
                                         .onFocusChanged { if (it.hasFocus) bumpIdle() },
-                                    colors = chromeIconColors
+                                    colors = bottomIconColors
                                 ) {
                                     Icon(
                                         Icons.Default.SkipNext,
