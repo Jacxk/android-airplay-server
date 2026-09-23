@@ -32,6 +32,7 @@ class DacpController(ctx: Context) {
     private val exec = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val discovering = AtomicBoolean(false)
+    private val rawResolving = AtomicBoolean(false)
 
     @Volatile var dacpId = ""
     @Volatile var activeRemote = ""
@@ -39,11 +40,18 @@ class DacpController(ctx: Context) {
     @Volatile private var port = 0
 
     fun update(dacpId: String, activeRemote: String) {
+        val senderChanged = this.dacpId != dacpId
         this.dacpId = dacpId
         this.activeRemote = activeRemote
-        host = ""
-        port = 0
-        _resolveAll()
+        if (senderChanged) {
+            host = ""
+            port = 0
+        }
+        ensureResolved()
+    }
+
+    fun ensureResolved() {
+        if (!_resolved() && dacpId.isNotEmpty()) _resolveAll()
     }
 
     fun play() = _send("/ctrl-int/1/play")
@@ -82,7 +90,15 @@ class DacpController(ctx: Context) {
         if (dacpId.isEmpty()) return
         _resolveDirect()
         _discover()
-        exec.execute { _mdnsResolve() }
+        if (rawResolving.compareAndSet(false, true)) {
+            exec.execute {
+                try {
+                    _mdnsResolve()
+                } finally {
+                    rawResolving.set(false)
+                }
+            }
+        }
     }
 
     private fun _resolveDirect() {
@@ -231,13 +247,15 @@ class DacpController(ctx: Context) {
                     result.setException(IOException("dacp endpoint not resolved"))
                     return@execute
                 }
+                val targetHost = host
+                val targetPort = port
                 try {
-                    val url = "http://$host:$port$path"
-                    Log.i(TAG, "DACP $path -> $host:$port")
+                    val url = "http://$targetHost:$targetPort$path"
+                    Log.i(TAG, "DACP $path -> $targetHost:$targetPort")
                     val conn = URL(url).openConnection() as HttpURLConnection
                     conn.requestMethod = "GET"
                     conn.setRequestProperty("Active-Remote", activeRemote)
-                    conn.setRequestProperty("Host", "$host:$port")
+                    conn.setRequestProperty("Host", "$targetHost:$targetPort")
                     conn.connectTimeout = 2000
                     conn.readTimeout = 2000
                     val code = conn.responseCode
@@ -247,10 +265,12 @@ class DacpController(ctx: Context) {
                         result.set(Unit)
                     } else {
                         Log.w(TAG, "DACP $path -> HTTP $code")
+                        _invalidateEndpoint(targetHost, targetPort)
                         result.setException(IOException("HTTP $code"))
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "DACP send failed: $path", e)
+                    _invalidateEndpoint(targetHost, targetPort)
                     result.setException(e)
                 }
             }
@@ -260,9 +280,17 @@ class DacpController(ctx: Context) {
         return result
     }
 
+    private fun _invalidateEndpoint(expectedHost: String, expectedPort: Int) {
+        if (host == expectedHost && port == expectedPort) {
+            host = ""
+            port = 0
+        }
+        ensureResolved()
+    }
+
     private companion object {
         const val TAG = "DacpController"
-        const val SERVICE_TYPE = "_dacp._tcp"
+        const val SERVICE_TYPE = "_dacp._tcp."
         const val DISCOVER_MS = 8_000L
         const val MDNS_TIMEOUT_MS = 2_000
         const val TYPE_A = 1
@@ -286,7 +314,9 @@ class DacpController(ctx: Context) {
             }
             dos.writeByte(0)
             dos.writeShort(type)
-            dos.writeShort(1) // IN
+            // Request a unicast mDNS response. The socket uses an ephemeral
+            // source port and therefore cannot receive multicast replies on 5353.
+            dos.writeShort(0x8001) // QU bit + IN
             dos.flush()
             return out.toByteArray()
         }

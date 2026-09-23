@@ -88,6 +88,7 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
     }
     fun audioScanEnd() { service?.dacpController?.playResume() }
     fun audioMuteToggle() { service?.dacpController?.muteToggle() }
+    fun refreshAudioRemote() { service?.dacpController?.ensureResolved() }
     fun audioTogglePlayPause() {
         service?.togglePlayPause()
         // sync immediately so the bar freezes before the next poll

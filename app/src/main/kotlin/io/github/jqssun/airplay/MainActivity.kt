@@ -150,6 +150,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshAudioRemote()
+    }
+
     fun enterPip() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         enterPictureInPictureMode(_pipParams())
