@@ -12,7 +12,9 @@ val localProps = Properties().apply {
     rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use(::load)
 }
 
-val allAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+// Soundbar (Askey sti6251d315) is armeabi-v7a; build that ABI only for faster local installs.
+// Restore the full list when shipping multi-ABI releases.
+val allAbis = listOf("armeabi-v7a")
 
 android {
     namespace = "io.github.jqssun.airplay"
