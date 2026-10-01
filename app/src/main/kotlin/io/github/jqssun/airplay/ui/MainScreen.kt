@@ -81,8 +81,6 @@ import androidx.media3.ui.compose.material3.MiniController
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 private enum class Tab(val labelRes: Int, val icon: ImageVector) {
     OVERVIEW(R.string.tab_overview, Icons.Default.Cast),
@@ -1053,9 +1051,9 @@ private fun viewportRegionLuminances(
 }
 
 /**
- * Chooses the foreground whose contrast remains strongest across the zone.
- * The 10th percentile protects against sizeable light/dark patches while the
- * median prevents a few outlier pixels from flipping otherwise uniform art.
+ * Strongly prefers white and switches to black only when the zone is predominantly
+ * bright. The median drives the choice while the 10th percentile still gives
+ * sizeable bright patches limited influence.
  */
 private fun contrastFromSamples(luminances: FloatArray): ZoneContrast {
     if (luminances.isEmpty()) return ZoneContrast(Color.White, Color.Black)
@@ -1064,12 +1062,11 @@ private fun contrastFromSamples(luminances: FloatArray): ZoneContrast {
         ratios.sort()
         val low = ratios[((ratios.lastIndex * 0.10f).toInt()).coerceIn(ratios.indices)]
         val median = ratios[ratios.size / 2]
-        return low * 0.72f + median * 0.28f
+        return low * 0.25f + median * 0.75f
     }
 
-    val blackRatios = FloatArray(luminances.size) { (luminances[it] + 0.05f) / 0.05f }
     val whiteRatios = FloatArray(luminances.size) { 1.05f / (luminances[it] + 0.05f) }
-    return if (robustScore(blackRatios) > robustScore(whiteRatios)) {
+    return if (robustScore(whiteRatios) < 2.25f) {
         ZoneContrast(chrome = Color(0xFF101010), scrim = Color.White)
     } else {
         ZoneContrast(chrome = Color.White, scrim = Color.Black)
@@ -1222,16 +1219,15 @@ private fun FullscreenNowPlaying(
     val topEnd = (72f / configuration.screenHeightDp.coerceAtLeast(1)).coerceIn(0.04f, 0.16f)
     val bottomStart = (1f - 104f / configuration.screenHeightDp.coerceAtLeast(1))
         .coerceIn(0.80f, 0.94f)
-    val contrast by produceState(
-        initialValue = nowPlayingContrastFromCover(null, viewportAspect, topEnd, bottomStart),
+    // Sampling is intentionally synchronous: it is small enough to finish within
+    // the composition frame, keeping artwork and chrome color updates atomic.
+    val contrast = remember(
         track.coverArt,
         viewportAspect,
         topEnd,
         bottomStart,
     ) {
-        value = withContext(Dispatchers.Default) {
-            nowPlayingContrastFromCover(track.coverArt, viewportAspect, topEnd, bottomStart)
-        }
+        nowPlayingContrastFromCover(track.coverArt, viewportAspect, topEnd, bottomStart)
     }
     val top = contrast.top
     val middle = contrast.middle
